@@ -1,0 +1,46 @@
+# Note: With ReadWriteOnce PVCs, only replicaCount: 1 is supported
+replicaCount: 1
+
+image:
+  repository: ebennerv/athena-tts
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 5002
+
+# Set via --set auth.token=<token> or use external secrets for production
+auth:
+  token: ""
+
+resources:
+  requests:
+    memory: "4Gi"
+    cpu: "2"
+    nvidia.com/gpu: "1"
+  limits:
+    memory: "8Gi"
+    cpu: "4"
+    nvidia.com/gpu: "1"
+
+persistence:
+  workspace:
+    enabled: true
+    size: 10Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+  modelCache:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+
+nodeSelector: {}
+
+tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+
+affinity: {}

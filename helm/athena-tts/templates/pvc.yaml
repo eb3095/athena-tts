@@ -1,0 +1,35 @@
+{{- if .Values.persistence.workspace.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "athena-tts.fullname" . }}-workspace
+  labels:
+    {{- include "athena-tts.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.persistence.workspace.accessMode }}
+  {{- if .Values.persistence.workspace.storageClass }}
+  storageClassName: {{ .Values.persistence.workspace.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.workspace.size }}
+{{- end }}
+---
+{{- if .Values.persistence.modelCache.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "athena-tts.fullname" . }}-model-cache
+  labels:
+    {{- include "athena-tts.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.persistence.modelCache.accessMode }}
+  {{- if .Values.persistence.modelCache.storageClass }}
+  storageClassName: {{ .Values.persistence.modelCache.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.modelCache.size }}
+{{- end }}
