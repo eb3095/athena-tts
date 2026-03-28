@@ -4,7 +4,7 @@ replicaCount: 1
 image:
   repository: ebennerv/athena-tts
   tag: latest
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
 
 service:
   type: ClusterIP
@@ -46,6 +46,20 @@ persistence:
     size: 20Gi
     storageClass: ""
     accessMode: ReadWriteOnce
+
+ingress:
+  enabled: false
+  host: ""
+  entryPoints:
+    - web
+  middlewares: []
+  tls:
+    enabled: false
+    secretName: ""
+    certManager:
+      enabled: false
+      issuer: ""
+      issuerKind: ClusterIssuer
 
 nodeSelector: {}
 
