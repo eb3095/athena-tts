@@ -1,4 +1,4 @@
-FROM ghcr.io/coqui-ai/tts:latest
+FROM --platform=linux/amd64 ghcr.io/coqui-ai/tts:latest
 
 COPY requirements.txt /requirements.txt
 RUN pip install -r /requirements.txt
