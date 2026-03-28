@@ -7,7 +7,7 @@ WORKSPACE ?= $(PWD)/workspace
 MODEL_CACHE ?= $(PWD)/model-cache
 
 build:
-	docker build -t $(IMAGE):$(TAG) .
+	docker buildx build --platform linux/amd64 -t $(IMAGE):$(TAG) --load .
 
 push: build
 	docker push $(IMAGE):$(TAG)
