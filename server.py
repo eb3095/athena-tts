@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Form
+from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Form, Request
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.background import BackgroundTask
@@ -8,7 +8,10 @@ import tempfile
 import os
 import re
 import secrets
+import time
+import asyncio
 from typing import Optional
+from collections import defaultdict
 
 app = FastAPI()
 security = HTTPBearer()
@@ -18,6 +21,60 @@ WORKSPACE_DIR = "/workspace"
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
 MAX_TEXT_LENGTH = 5000
 SAFE_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+# Rate limiting and security configuration (env vars with defaults)
+RATE_LIMIT_REQUESTS = int(os.environ.get("RATE_LIMIT_REQUESTS", "300"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
+AUTH_FAIL_BAN_THRESHOLD = int(os.environ.get("AUTH_FAIL_BAN_THRESHOLD", "3"))
+AUTH_FAIL_BAN_DURATION_SECONDS = int(os.environ.get("AUTH_FAIL_BAN_DURATION_SECONDS", "604800"))  # 1 week
+
+# In-memory stores for rate limiting and bans
+rate_limit_store: dict[str, list[float]] = defaultdict(list)
+auth_fail_store: dict[str, list[float]] = defaultdict(list)
+banned_ips: dict[str, float] = {}
+
+
+def get_client_ip(request: Request) -> str:
+    # Cloudflare sets this header with the true client IP
+    cf_ip = request.headers.get("CF-Connecting-IP")
+    if cf_ip:
+        return cf_ip.strip()
+    # Fallback for other reverse proxies
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def is_ip_banned(ip: str) -> bool:
+    if ip in banned_ips:
+        ban_expiry = banned_ips[ip]
+        if time.time() < ban_expiry:
+            return True
+        del banned_ips[ip]
+    return False
+
+
+def record_auth_failure(ip: str):
+    now = time.time()
+    window_start = now - AUTH_FAIL_BAN_DURATION_SECONDS
+    auth_fail_store[ip] = [t for t in auth_fail_store[ip] if t > window_start]
+    auth_fail_store[ip].append(now)
+    if len(auth_fail_store[ip]) >= AUTH_FAIL_BAN_THRESHOLD:
+        banned_ips[ip] = now + AUTH_FAIL_BAN_DURATION_SECONDS
+        del auth_fail_store[ip]
+
+
+def check_rate_limit(ip: str):
+    now = time.time()
+    window_start = now - RATE_LIMIT_WINDOW_SECONDS
+    rate_limit_store[ip] = [t for t in rate_limit_store[ip] if t > window_start]
+    if len(rate_limit_store[ip]) >= RATE_LIMIT_REQUESTS:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded. Max {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW_SECONDS} seconds.",
+        )
+    rate_limit_store[ip].append(now)
 
 model_path = "/root/.local/share/tts/tts_models--multilingual--multi-dataset--xtts_v2"
 tos_file = os.path.join(model_path, "tos_agreed.txt")
@@ -30,13 +87,24 @@ if not os.path.exists(tos_file):
         f.write("agreed")
 
 tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+tts_semaphore = asyncio.Semaphore(1)
 
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def verify_token(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    ip = get_client_ip(request)
+
+    if is_ip_banned(ip):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    check_rate_limit(ip)
+
     if not AUTH_TOKEN:
         raise HTTPException(status_code=500, detail="AUTH_TOKEN not configured")
+
     if not secrets.compare_digest(credentials.credentials, AUTH_TOKEN):
-        raise HTTPException(status_code=401, detail="Invalid authorization token")
+        record_auth_failure(ip)
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     return credentials
 
 
@@ -118,9 +186,13 @@ async def synthesize(
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_out:
         tmp_out_path = tmp_out.name
 
-    tts.tts_to_file(
-        text=text, speaker_wav=speaker_path, language="en", file_path=tmp_out_path
-    )
+    async with tts_semaphore:
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: tts.tts_to_file(
+                text=text, speaker_wav=speaker_path, language="en", file_path=tmp_out_path
+            ),
+        )
 
     return FileResponse(
         tmp_out_path,
@@ -128,6 +200,17 @@ async def synthesize(
         filename="output.wav",
         background=BackgroundTask(cleanup_file, tmp_out_path),
     )
+
+
+@app.get("/api/speakers")
+async def list_speakers(
+    _: HTTPAuthorizationCredentials = Depends(verify_token),
+):
+    speakers = []
+    for filename in os.listdir(WORKSPACE_DIR):
+        if filename.endswith(".wav"):
+            speakers.append(filename[:-4])
+    return {"speakers": sorted(speakers)}
 
 
 @app.get("/health")

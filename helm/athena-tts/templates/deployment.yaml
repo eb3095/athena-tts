@@ -40,6 +40,14 @@ spec:
                 secretKeyRef:
                   name: {{ include "athena-tts.fullname" . }}-auth
                   key: token
+            - name: RATE_LIMIT_REQUESTS
+              value: {{ .Values.security.rateLimitRequests | quote }}
+            - name: RATE_LIMIT_WINDOW_SECONDS
+              value: {{ .Values.security.rateLimitWindowSeconds | quote }}
+            - name: AUTH_FAIL_BAN_THRESHOLD
+              value: {{ .Values.security.authFailBanThreshold | quote }}
+            - name: AUTH_FAIL_BAN_DURATION_SECONDS
+              value: {{ .Values.security.authFailBanDurationSeconds | quote }}
           startupProbe:
             httpGet:
               path: /health
