@@ -1,5 +1,17 @@
 {{- if .Values.ingress.enabled }}
 apiVersion: traefik.containo.us/v1alpha1
+kind: ServersTransport
+metadata:
+  name: {{ include "athena-tts.fullname" . }}-transport
+  labels:
+    {{- include "athena-tts.labels" . | nindent 4 }}
+spec:
+  forwardingTimeouts:
+    dialTimeout: {{ .Values.ingress.timeout | default "600s" }}
+    responseHeaderTimeout: {{ .Values.ingress.timeout | default "600s" }}
+    idleConnTimeout: {{ .Values.ingress.timeout | default "600s" }}
+---
+apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRoute
 metadata:
   name: {{ include "athena-tts.fullname" . }}
@@ -18,6 +30,7 @@ spec:
       services:
         - name: {{ include "athena-tts.fullname" . }}
           port: {{ .Values.service.port }}
+          serversTransport: {{ include "athena-tts.fullname" . }}-transport
       {{- if .Values.ingress.middlewares }}
       middlewares:
         {{- toYaml .Values.ingress.middlewares | nindent 8 }}
