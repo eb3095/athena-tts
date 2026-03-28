@@ -8,6 +8,10 @@ A lightweight text-to-speech webserver using the XTTS v2 model from Coqui TTS.
 - Bearer token authentication
 - Speaker voice cloning from uploaded WAV files
 - Persistent speaker and model storage
+- Rate limiting per IP address
+- IP banning after repeated auth failures
+- Request queuing (one TTS operation at a time)
+- Cloudflare-compatible IP detection
 - Kubernetes deployment via Helm
 
 ## Quick Start (Makefile)
@@ -51,6 +55,16 @@ docker run -d \
   --gpus all \
   ebennerv/athena-tts:latest
 ```
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `AUTH_TOKEN` | Bearer token for API auth | `""` (required) |
+| `RATE_LIMIT_REQUESTS` | Max requests per window | `300` |
+| `RATE_LIMIT_WINDOW_SECONDS` | Rate limit window | `60` |
+| `AUTH_FAIL_BAN_THRESHOLD` | Auth failures before IP ban | `3` |
+| `AUTH_FAIL_BAN_DURATION_SECONDS` | Ban duration | `604800` (1 week) |
 
 ## API
 
@@ -99,11 +113,29 @@ The uploaded speaker file is saved to `/workspace` and can be reused by name in 
 
 **Error responses:**
 - `400`: Invalid input (missing fields, invalid speaker name, text too long)
-- `401`: Invalid or missing authorization token
+- `401`: Unauthorized (invalid token or banned IP)
 - `404`: Speaker not found
 - `409`: Speaker already exists (when uploading)
 - `413`: File too large
+- `429`: Rate limit exceeded
 - `500`: Server error (AUTH_TOKEN not configured)
+
+### GET /api/speakers
+
+List available speaker voices.
+
+**Headers:**
+- `Authorization: Bearer <AUTH_TOKEN>` (required)
+
+```bash
+curl http://localhost:5002/api/speakers \
+  -H "Authorization: Bearer your-secret-token"
+```
+
+**Response:**
+```json
+{"speakers": ["jane", "john", "narrator"]}
+```
 
 ### GET /health
 
@@ -139,6 +171,10 @@ Key values in `values.yaml`:
 | `auth.token` | Bearer token for API auth | `""` |
 | `service.type` | Kubernetes service type | `ClusterIP` |
 | `service.port` | Service port | `5002` |
+| `security.rateLimitRequests` | Max requests per window | `300` |
+| `security.rateLimitWindowSeconds` | Rate limit window | `60` |
+| `security.authFailBanThreshold` | Auth failures before IP ban | `3` |
+| `security.authFailBanDurationSeconds` | Ban duration | `604800` |
 | `persistence.workspace.enabled` | Enable speaker file persistence | `true` |
 | `persistence.workspace.size` | PVC size for speaker files | `10Gi` |
 | `persistence.modelCache.enabled` | Enable model cache persistence | `true` |
@@ -177,6 +213,16 @@ Speaker WAV files are stored in `/workspace`. Requirements:
 - Format: WAV
 - Sample rate: 22050 Hz recommended
 - Duration: 6-30 seconds of clean speech
+
+## Ethical Use & Disclaimer
+
+**You are solely responsible for the ethical use of this software.** By using athena-tts, you agree to:
+
+- Only clone voices for which you have explicit permission from the voice owner
+- Not use this software to create deceptive, fraudulent, or harmful content
+- Comply with all applicable laws and regulations regarding synthetic media
+
+**NO LIABILITY:** This software is provided "as is" without warranty of any kind. The authors and contributors accept no responsibility or liability for any misuse, damages, or legal consequences arising from the use of this software. Use at your own risk.
 
 ## License
 
