@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="Athena Logo" width="200">
+</p>
+
 # athena-tts
 
 A text-to-speech agent using the XTTS v2 model from Coqui TTS. Operates as a distributed worker that registers with athena-server and processes TTS jobs from a shared queue.
