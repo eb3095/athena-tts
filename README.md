@@ -10,7 +10,8 @@ A lightweight text-to-speech webserver using the XTTS v2 model from Coqui TTS.
 - Persistent speaker and model storage
 - Rate limiting per IP address
 - IP banning after repeated auth failures
-- Request queuing (one TTS operation at a time)
+- Synchronous API with request queuing (one TTS operation at a time)
+- Async job queue API for long-running requests
 - Cloudflare-compatible IP detection
 - Kubernetes deployment via Helm
 
@@ -65,6 +66,8 @@ docker run -d \
 | `RATE_LIMIT_WINDOW_SECONDS` | Rate limit window | `60` |
 | `AUTH_FAIL_BAN_THRESHOLD` | Auth failures before IP ban | `3` |
 | `AUTH_FAIL_BAN_DURATION_SECONDS` | Ban duration | `604800` (1 week) |
+| `JOB_EXPIRY_SECONDS` | How long completed jobs are retained | `3600` (1 hour) |
+| `MAX_QUEUE_SIZE` | Maximum pending jobs in queue | `100` |
 
 ## API
 
@@ -119,6 +122,80 @@ The uploaded speaker file is saved to `/workspace` and can be reused by name in 
 - `413`: File too large
 - `429`: Rate limit exceeded
 - `500`: Server error (AUTH_TOKEN not configured)
+
+### POST /api/tts/job
+
+Submit an async TTS job. Returns immediately with a job ID for polling.
+
+**Headers:**
+- `Authorization: Bearer <AUTH_TOKEN>` (required)
+
+**Form Data:**
+- `text` (required): Text to synthesize (max 5000 characters)
+- `speaker` (required): Name of existing speaker (without .wav extension)
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:5002/api/tts/job \
+  -H "Authorization: Bearer your-secret-token" \
+  -F "text=Hello, this is a test." \
+  -F "speaker=john"
+```
+
+**Response (202 Accepted):**
+```json
+{"job_id": "550e8400-e29b-41d4-a716-446655440000", "status": "pending"}
+```
+
+**Error responses:**
+- `400`: Invalid input (text too long, invalid speaker name)
+- `401`: Unauthorized
+- `404`: Speaker not found
+- `429`: Rate limit exceeded
+- `503`: Queue full
+
+### GET /api/tts/job/{job_id}
+
+Get the status of a TTS job.
+
+**Headers:**
+- `Authorization: Bearer <AUTH_TOKEN>` (required)
+
+**Example:**
+
+```bash
+curl http://localhost:5002/api/tts/job/550e8400-e29b-41d4-a716-446655440000 \
+  -H "Authorization: Bearer your-secret-token"
+```
+
+**Response (pending/processing):**
+```json
+{"job_id": "550e8400-e29b-41d4-a716-446655440000", "status": "processing"}
+```
+
+**Response (completed):**
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "completed",
+  "audio": "BASE64_ENCODED_WAV_DATA..."
+}
+```
+
+**Response (failed):**
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "failed",
+  "error": "TTS synthesis failed: ..."
+}
+```
+
+**Error responses:**
+- `401`: Unauthorized
+- `404`: Job not found
+- `429`: Rate limit exceeded
 
 ### GET /api/speakers
 

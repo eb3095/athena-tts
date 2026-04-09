@@ -35,19 +35,15 @@ spec:
               containerPort: 5002
               protocol: TCP
           env:
-            - name: AUTH_TOKEN
+            - name: ATHENA_SERVER_URL
+              value: {{ .Values.agent.serverUrl | quote }}
+            - name: AGENT_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "athena-tts.fullname" . }}-auth
-                  key: token
-            - name: RATE_LIMIT_REQUESTS
-              value: {{ .Values.security.rateLimitRequests | quote }}
-            - name: RATE_LIMIT_WINDOW_SECONDS
-              value: {{ .Values.security.rateLimitWindowSeconds | quote }}
-            - name: AUTH_FAIL_BAN_THRESHOLD
-              value: {{ .Values.security.authFailBanThreshold | quote }}
-            - name: AUTH_FAIL_BAN_DURATION_SECONDS
-              value: {{ .Values.security.authFailBanDurationSeconds | quote }}
+                  name: {{ include "athena-tts.fullname" . }}-agent
+                  key: key
+            - name: POLL_INTERVAL
+              value: {{ .Values.agent.pollInterval | quote }}
           startupProbe:
             httpGet:
               path: /health

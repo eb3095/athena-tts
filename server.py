@@ -1,80 +1,41 @@
-from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Form, Request
-from fastapi.responses import FileResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from starlette.background import BackgroundTask
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
 from TTS.api import TTS
 import uvicorn
+import httpx
 import tempfile
 import os
+import sys
 import re
-import secrets
-import time
 import asyncio
+import uuid
+import base64
+import logging
 from typing import Optional
-from collections import defaultdict
 
-app = FastAPI()
-security = HTTPBearer()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger(__name__)
 
-AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "")
 WORKSPACE_DIR = "/workspace"
-MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
 MAX_TEXT_LENGTH = 5000
 SAFE_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
 
-# Rate limiting and security configuration (env vars with defaults)
-RATE_LIMIT_REQUESTS = int(os.environ.get("RATE_LIMIT_REQUESTS", "300"))
-RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
-AUTH_FAIL_BAN_THRESHOLD = int(os.environ.get("AUTH_FAIL_BAN_THRESHOLD", "3"))
-AUTH_FAIL_BAN_DURATION_SECONDS = int(os.environ.get("AUTH_FAIL_BAN_DURATION_SECONDS", "604800"))  # 1 week
+ATHENA_SERVER_URL = os.environ.get("ATHENA_SERVER_URL", "").strip()
+AGENT_KEY = os.environ.get("AGENT_KEY", "").strip()
+AGENT_ID = os.environ.get("AGENT_ID", str(uuid.uuid4())).strip()
+AGENT_SERVICE_TYPE = "tts"
+POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0").strip())
+HEARTBEAT_INTERVAL = 60.0
 
-# In-memory stores for rate limiting and bans
-rate_limit_store: dict[str, list[float]] = defaultdict(list)
-auth_fail_store: dict[str, list[float]] = defaultdict(list)
-banned_ips: dict[str, float] = {}
+logger.info(f"Config: ATHENA_SERVER_URL={ATHENA_SERVER_URL[:30] + '...' if ATHENA_SERVER_URL else 'NOT SET'}")
+logger.info(f"Config: AGENT_KEY={'SET' if AGENT_KEY else 'NOT SET'}")
 
-
-def get_client_ip(request: Request) -> str:
-    # Cloudflare sets this header with the true client IP
-    cf_ip = request.headers.get("CF-Connecting-IP")
-    if cf_ip:
-        return cf_ip.strip()
-    # Fallback for other reverse proxies
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
-
-
-def is_ip_banned(ip: str) -> bool:
-    if ip in banned_ips:
-        ban_expiry = banned_ips[ip]
-        if time.time() < ban_expiry:
-            return True
-        del banned_ips[ip]
-    return False
-
-
-def record_auth_failure(ip: str):
-    now = time.time()
-    window_start = now - AUTH_FAIL_BAN_DURATION_SECONDS
-    auth_fail_store[ip] = [t for t in auth_fail_store[ip] if t > window_start]
-    auth_fail_store[ip].append(now)
-    if len(auth_fail_store[ip]) >= AUTH_FAIL_BAN_THRESHOLD:
-        banned_ips[ip] = now + AUTH_FAIL_BAN_DURATION_SECONDS
-        del auth_fail_store[ip]
-
-
-def check_rate_limit(ip: str):
-    now = time.time()
-    window_start = now - RATE_LIMIT_WINDOW_SECONDS
-    rate_limit_store[ip] = [t for t in rate_limit_store[ip] if t > window_start]
-    if len(rate_limit_store[ip]) >= RATE_LIMIT_REQUESTS:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded. Max {RATE_LIMIT_REQUESTS} requests per {RATE_LIMIT_WINDOW_SECONDS} seconds.",
-        )
-    rate_limit_store[ip].append(now)
+http_client: Optional[httpx.AsyncClient] = None
+background_tasks: list = []
 
 model_path = "/root/.local/share/tts/tts_models--multilingual--multi-dataset--xtts_v2"
 tos_file = os.path.join(model_path, "tos_agreed.txt")
@@ -90,127 +51,236 @@ tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
 tts_semaphore = asyncio.Semaphore(1)
 
 
-def verify_token(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
-    ip = get_client_ip(request)
-
-    if is_ip_banned(ip):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    check_rate_limit(ip)
-
-    if not AUTH_TOKEN:
-        raise HTTPException(status_code=500, detail="AUTH_TOKEN not configured")
-
-    if not secrets.compare_digest(credentials.credentials, AUTH_TOKEN):
-        record_auth_failure(ip)
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    return credentials
-
-
 def sanitize_speaker_name(name: str) -> str:
     base = os.path.basename(name)
     name_without_ext = os.path.splitext(base)[0]
     if not name_without_ext or not SAFE_NAME_PATTERN.match(name_without_ext):
-        raise HTTPException(
-            status_code=400,
-            detail="Speaker name must contain only alphanumeric characters, hyphens, and underscores",
+        raise ValueError(
+            "Speaker name must contain only alphanumeric characters, hyphens, and underscores"
         )
     return name_without_ext
 
 
-def cleanup_file(path: str):
+def get_available_speakers() -> list[str]:
+    """Get list of available speaker names from workspace directory."""
+    speakers = []
     try:
-        if os.path.exists(path):
-            os.remove(path)
+        for filename in os.listdir(WORKSPACE_DIR):
+            if filename.endswith(".wav"):
+                speakers.append(filename[:-4])
     except OSError:
         pass
+    return sorted(speakers)
 
 
-@app.post("/api/tts")
-async def synthesize(
-    text: str = Form(...),
-    speaker: Optional[str] = Form(None),
-    speaker_file: Optional[UploadFile] = File(None),
-    _: HTTPAuthorizationCredentials = Depends(verify_token),
-):
+async def agent_register():
+    """Register with athena-server as an agent."""
+    try:
+        speakers = get_available_speakers()
+        response = await http_client.post(
+            f"{ATHENA_SERVER_URL}/api/agents/register",
+            headers={"X-Agent-Key": AGENT_KEY},
+            json={
+                "agent_id": AGENT_ID,
+                "service_type": AGENT_SERVICE_TYPE,
+                "speakers": speakers,
+            },
+            timeout=10.0,
+        )
+        if response.status_code == 200:
+            logger.info(f"Registered as agent {AGENT_ID} with {len(speakers)} speakers")
+            return True
+        else:
+            logger.error(f"Failed to register: {response.status_code} {response.text}")
+            return False
+    except Exception as e:
+        logger.error(f"Failed to register: {e}")
+        return False
+
+
+async def agent_heartbeat():
+    """Send heartbeat to athena-server with current speaker list."""
+    try:
+        speakers = get_available_speakers()
+        response = await http_client.post(
+            f"{ATHENA_SERVER_URL}/api/agents/heartbeat",
+            headers={"X-Agent-Key": AGENT_KEY},
+            json={
+                "agent_id": AGENT_ID,
+                "service_type": AGENT_SERVICE_TYPE,
+                "speakers": speakers,
+            },
+            timeout=10.0,
+        )
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Heartbeat error: {e}")
+        return False
+
+
+async def agent_poll():
+    """Poll for a job from athena-server."""
+    try:
+        response = await http_client.post(
+            f"{ATHENA_SERVER_URL}/api/agents/jobs/poll",
+            headers={"X-Agent-Key": AGENT_KEY},
+            json={"agent_id": AGENT_ID, "service_type": AGENT_SERVICE_TYPE},
+            timeout=10.0,
+        )
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        return data.get("job")
+    except Exception as e:
+        logger.error(f"Poll error: {e}")
+        return None
+
+
+async def agent_complete(job_id: str, status: str, result: Optional[dict], error: Optional[str]):
+    """Report job completion to athena-server."""
+    try:
+        payload = {
+            "agent_id": AGENT_ID,
+            "status": status,
+            "result": result,
+            "error": error,
+        }
+        payload_size = len(str(payload))
+        logger.info(f"Completing job {job_id} with status={status}, payload_size={payload_size}")
+        
+        response = await http_client.post(
+            f"{ATHENA_SERVER_URL}/api/agents/jobs/{job_id}/complete",
+            headers={"X-Agent-Key": AGENT_KEY},
+            json=payload,
+            timeout=60.0,
+        )
+        
+        if response.status_code == 200:
+            logger.info(f"Job {job_id} completed successfully")
+            return True
+        else:
+            logger.error(f"Job {job_id} complete failed: {response.status_code} {response.text}")
+            return False
+    except Exception as e:
+        logger.error(f"Complete error for job {job_id}: {e}")
+        return False
+
+
+async def process_agent_job(job: dict):
+    """Process a TTS job received from athena-server."""
+    job_id = job["job_id"]
+    payload = job["payload"]
+    text = payload.get("text", "")
+    speaker = payload.get("speaker", "")
+
     if len(text) > MAX_TEXT_LENGTH:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Text exceeds maximum length of {MAX_TEXT_LENGTH} characters",
-        )
+        await agent_complete(job_id, "failed", None, f"Text exceeds max length of {MAX_TEXT_LENGTH}")
+        return
 
-    if not speaker and not speaker_file:
-        raise HTTPException(
-            status_code=400,
-            detail="Either speaker name or speaker_file must be provided",
-        )
-
-    if speaker and speaker_file:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide either speaker name or speaker_file, not both",
-        )
-
-    if speaker_file:
-        speaker_name = sanitize_speaker_name(speaker_file.filename or "")
-        speaker_path = os.path.join(WORKSPACE_DIR, f"{speaker_name}.wav")
-
-        content = await speaker_file.read()
-        if len(content) > MAX_UPLOAD_SIZE:
-            raise HTTPException(
-                status_code=413,
-                detail=f"File exceeds maximum size of {MAX_UPLOAD_SIZE // (1024*1024)}MB",
-            )
-
-        try:
-            fd = os.open(speaker_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-            try:
-                os.write(fd, content)
-            finally:
-                os.close(fd)
-        except FileExistsError:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Speaker '{speaker_name}' already exists. Use the speaker name to reference it.",
-            )
-    else:
-        speaker_name = sanitize_speaker_name(speaker or "")
+    try:
+        speaker_name = sanitize_speaker_name(speaker)
         speaker_path = os.path.join(WORKSPACE_DIR, f"{speaker_name}.wav")
 
         if not os.path.isfile(speaker_path):
-            raise HTTPException(
-                status_code=404, detail=f"Speaker '{speaker_name}' not found"
+            await agent_complete(job_id, "failed", None, f"Speaker '{speaker_name}' not found")
+            return
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_out:
+            tmp_out_path = tmp_out.name
+
+        async with tts_semaphore:
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: tts.tts_to_file(
+                    text=text,
+                    speaker_wav=speaker_path,
+                    language="en",
+                    file_path=tmp_out_path,
+                ),
             )
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_out:
-        tmp_out_path = tmp_out.name
+        with open(tmp_out_path, "rb") as f:
+            audio_bytes = f.read()
+        os.remove(tmp_out_path)
 
-    async with tts_semaphore:
-        await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: tts.tts_to_file(
-                text=text, speaker_wav=speaker_path, language="en", file_path=tmp_out_path
-            ),
-        )
+        audio_base64 = base64.b64encode(audio_bytes).decode()
+        await agent_complete(job_id, "completed", {"audio": audio_base64}, None)
 
-    return FileResponse(
-        tmp_out_path,
-        media_type="audio/wav",
-        filename="output.wav",
-        background=BackgroundTask(cleanup_file, tmp_out_path),
+    except Exception as e:
+        await agent_complete(job_id, "failed", None, str(e))
+
+
+async def agent_worker():
+    """Main agent worker loop - polls for jobs and processes them."""
+    logger.info("Agent worker starting...")
+    try:
+        registered = False
+        while not registered:
+            logger.info("Attempting to register...")
+            registered = await agent_register()
+            if not registered:
+                logger.info("Registration failed, retrying in 5s...")
+                await asyncio.sleep(5)
+
+        logger.info("Registration complete, starting poll loop")
+        while True:
+            job = await agent_poll()
+
+            if job:
+                await process_agent_job(job)
+            else:
+                await asyncio.sleep(POLL_INTERVAL)
+    except asyncio.CancelledError:
+        logger.info("Agent worker shutting down gracefully")
+        raise
+
+
+async def heartbeat_worker():
+    """Background task to send heartbeats every minute."""
+    logger.info("Heartbeat worker starting...")
+    try:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            await agent_heartbeat()
+    except asyncio.CancelledError:
+        logger.info("Heartbeat worker shutting down gracefully")
+        raise
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+
+    logger.info("Lifespan startup beginning...")
+
+    if not ATHENA_SERVER_URL or not AGENT_KEY:
+        logger.error("ATHENA_SERVER_URL and AGENT_KEY are required!")
+        raise RuntimeError("ATHENA_SERVER_URL and AGENT_KEY are required")
+
+    http_client = httpx.AsyncClient(
+        limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
     )
 
+    logger.info(f"Agent mode - connecting to {ATHENA_SERVER_URL}")
+    background_tasks.append(asyncio.create_task(agent_worker()))
+    background_tasks.append(asyncio.create_task(heartbeat_worker()))
+    logger.info("Background tasks started")
 
-@app.get("/api/speakers")
-async def list_speakers(
-    _: HTTPAuthorizationCredentials = Depends(verify_token),
-):
-    speakers = []
-    for filename in os.listdir(WORKSPACE_DIR):
-        if filename.endswith(".wav"):
-            speakers.append(filename[:-4])
-    return {"speakers": sorted(speakers)}
+    yield
+
+    for task in background_tasks:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    background_tasks.clear()
+
+    if http_client:
+        await http_client.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/health")

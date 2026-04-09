@@ -10,20 +10,11 @@ service:
   type: ClusterIP
   port: 5002
 
-# Set via --set auth.token=<token> or use external secrets for production
-auth:
-  token: ""
-
-# Rate limiting and security settings
-security:
-  # Max requests per window (0 to disable)
-  rateLimitRequests: 300
-  # Rate limit window in seconds
-  rateLimitWindowSeconds: 60
-  # Number of auth failures before IP ban
-  authFailBanThreshold: 3
-  # Ban duration in seconds (default: 1 week = 604800)
-  authFailBanDurationSeconds: 604800
+# Agent configuration (required - TTS runs as an agent polling athena-server)
+agent:
+  serverUrl: "http://athena-server:5003"
+  key: ""
+  pollInterval: 1.0
 
 resources:
   requests:
@@ -50,7 +41,6 @@ persistence:
 ingress:
   enabled: false
   host: ""
-  timeout: "600s"
   middlewares: []
   tls:
     enabled: false

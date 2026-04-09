@@ -1,0 +1,30 @@
+[Unit]
+Description=Athena TTS Docker Service
+After=docker.service
+Requires=docker.service
+
+[Service]
+User=athena
+Group=athena
+Restart=always
+TimeoutStartSec=300
+
+EnvironmentFile=/etc/athena/tts.env
+
+ExecStartPre=/usr/bin/docker pull ebennerv/athena-tts:latest
+ExecStartPre=-/usr/bin/docker rm -f athena-tts
+
+ExecStart=/usr/bin/docker run --rm --name athena-tts \
+    -p 5002:5002 \
+    -v /opt/athena/tts/workspace:/workspace \
+    -v /opt/athena/tts/share:/root/.local/share/tts \
+    -e ATHENA_SERVER_URL=${ATHENA_SERVER_URL} \
+    -e AGENT_KEY=${AGENT_KEY} \
+    -e POLL_INTERVAL=${POLL_INTERVAL} \
+    --gpus all \
+    ebennerv/athena-tts:latest
+
+ExecStop=/usr/bin/docker stop athena-tts
+
+[Install]
+WantedBy=multi-user.target
