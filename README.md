@@ -1,288 +1,136 @@
 # athena-tts
 
-A lightweight text-to-speech webserver using the XTTS v2 model from Coqui TTS.
+A text-to-speech agent using the XTTS v2 model from Coqui TTS. Operates as a distributed worker that registers with athena-server and processes TTS jobs from a shared queue.
 
 ## Features
 
 - XTTS v2 multilingual text-to-speech
-- Bearer token authentication
-- Speaker voice cloning from uploaded WAV files
+- Agent-based architecture (registers with athena-server)
+- Heartbeat monitoring (reports liveness every minute)
+- Speaker voice cloning from WAV files
+- Automatic speaker list announcement to server
 - Persistent speaker and model storage
-- Rate limiting per IP address
-- IP banning after repeated auth failures
-- Synchronous API with request queuing (one TTS operation at a time)
-- Async job queue API for long-running requests
-- Cloudflare-compatible IP detection
-- Kubernetes deployment via Helm
+- Single-worker model with job polling
+- GPU acceleration support
 
-## Quick Start (Makefile)
+## Architecture
+
+```
+┌─────────────────┐     ┌─────────────────┐
+│  athena-server  │◀────│   athena-tts    │
+│    (central)    │     │    (agent)      │
+└────────┬────────┘     └─────────────────┘
+         │
+         │  1. Register
+         │  2. Heartbeat (every 60s, with speaker list)
+         │  3. Poll for jobs
+         │  4. Complete jobs
+         │
+┌────────▼────────┐
+│      Redis      │
+│   (job queue)   │
+└─────────────────┘
+```
+
+The agent:
+1. Registers with athena-server on startup
+2. Sends heartbeats every 60 seconds (includes available speakers)
+3. Polls for TTS jobs from the server
+4. Processes jobs using XTTS v2 model
+5. Reports job completion with base64-encoded audio
+
+## Configuration
+
+| Environment Variable | Description | Default |
+|---------------------|-------------|---------|
+| `ATHENA_SERVER_URL` | URL of athena-server | (required) |
+| `AGENT_KEY` | Shared secret for agent authentication | (required) |
+| `POLL_INTERVAL` | Seconds between job polls | `1.0` |
+
+## Quick Start (Docker)
 
 ```bash
 # Build the image
 make build
 
-# Run with GPU
-AUTH_TOKEN=your-secret-token make run
-
-# Run without GPU
-AUTH_TOKEN=your-secret-token make run-cpu
-
-# Check health
-make health
-
-# View logs
-make logs
-
-# Stop container
-make stop
-```
-
-## Docker
-
-### Build
-
-```bash
-docker build -t ebennerv/athena-tts:latest .
-```
-
-### Run
-
-```bash
+# Run with GPU (requires athena-server URL and agent key)
 docker run -d \
-  -p 5002:5002 \
-  -e AUTH_TOKEN=your-secret-token \
+  -e ATHENA_SERVER_URL=https://your-athena-server.com \
+  -e AGENT_KEY=your-agent-key \
   -v /path/to/speakers:/workspace \
   -v /path/to/models:/root/.local/share/tts \
   --gpus all \
   ebennerv/athena-tts:latest
 ```
 
-### Environment Variables
+## Systemd Service
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `AUTH_TOKEN` | Bearer token for API auth | `""` (required) |
-| `RATE_LIMIT_REQUESTS` | Max requests per window | `300` |
-| `RATE_LIMIT_WINDOW_SECONDS` | Rate limit window | `60` |
-| `AUTH_FAIL_BAN_THRESHOLD` | Auth failures before IP ban | `3` |
-| `AUTH_FAIL_BAN_DURATION_SECONDS` | Ban duration | `604800` (1 week) |
-| `JOB_EXPIRY_SECONDS` | How long completed jobs are retained | `3600` (1 hour) |
-| `MAX_QUEUE_SIZE` | Maximum pending jobs in queue | `100` |
+For running on a dedicated GPU server, use the provided systemd service file.
 
-## API
+### Setup
 
-### POST /api/tts
-
-Generate speech from text using a speaker voice.
-
-**Headers:**
-- `Authorization: Bearer <AUTH_TOKEN>` (required)
-
-**Form Data:**
-
-Option 1 - Use existing speaker:
-- `text` (required): Text to synthesize (max 5000 characters)
-- `speaker` (required): Name of existing speaker (without .wav extension)
-
-Option 2 - Upload new speaker:
-- `text` (required): Text to synthesize (max 5000 characters)
-- `speaker_file` (required): WAV file to use as speaker voice (max 50MB)
-
-**Speaker name constraints:**
-- Alphanumeric characters, hyphens, and underscores only
-- File extension is stripped automatically
-
-**Example - Existing speaker:**
+1. Create the environment file:
 
 ```bash
-curl -X POST http://localhost:5002/api/tts \
-  -H "Authorization: Bearer your-secret-token" \
-  -F "text=Hello, this is a test." \
-  -F "speaker=john" \
-  --output output.wav
+sudo mkdir -p /etc/athena
+sudo cp tts.env.example /etc/athena/tts.env
+sudo chmod 600 /etc/athena/tts.env
+# Edit with your values
+sudo nano /etc/athena/tts.env
 ```
 
-**Example - Upload new speaker:**
+2. Create storage directories:
 
 ```bash
-curl -X POST http://localhost:5002/api/tts \
-  -H "Authorization: Bearer your-secret-token" \
-  -F "text=Hello, this is a test." \
-  -F "speaker_file=@jane.wav" \
-  --output output.wav
+sudo mkdir -p /opt/athena/tts/workspace
+sudo mkdir -p /opt/athena/tts/share
+sudo chown -R athena:athena /opt/athena
 ```
 
-The uploaded speaker file is saved to `/workspace` and can be reused by name in subsequent requests.
-
-**Error responses:**
-- `400`: Invalid input (missing fields, invalid speaker name, text too long)
-- `401`: Unauthorized (invalid token or banned IP)
-- `404`: Speaker not found
-- `409`: Speaker already exists (when uploading)
-- `413`: File too large
-- `429`: Rate limit exceeded
-- `500`: Server error (AUTH_TOKEN not configured)
-
-### POST /api/tts/job
-
-Submit an async TTS job. Returns immediately with a job ID for polling.
-
-**Headers:**
-- `Authorization: Bearer <AUTH_TOKEN>` (required)
-
-**Form Data:**
-- `text` (required): Text to synthesize (max 5000 characters)
-- `speaker` (required): Name of existing speaker (without .wav extension)
-
-**Example:**
+3. Install the service:
 
 ```bash
-curl -X POST http://localhost:5002/api/tts/job \
-  -H "Authorization: Bearer your-secret-token" \
-  -F "text=Hello, this is a test." \
-  -F "speaker=john"
+sudo cp athena-tts.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable athena-tts
+sudo systemctl start athena-tts
 ```
 
-**Response (202 Accepted):**
-```json
-{"job_id": "550e8400-e29b-41d4-a716-446655440000", "status": "pending"}
-```
-
-**Error responses:**
-- `400`: Invalid input (text too long, invalid speaker name)
-- `401`: Unauthorized
-- `404`: Speaker not found
-- `429`: Rate limit exceeded
-- `503`: Queue full
-
-### GET /api/tts/job/{job_id}
-
-Get the status of a TTS job.
-
-**Headers:**
-- `Authorization: Bearer <AUTH_TOKEN>` (required)
-
-**Example:**
+### Service Commands
 
 ```bash
-curl http://localhost:5002/api/tts/job/550e8400-e29b-41d4-a716-446655440000 \
-  -H "Authorization: Bearer your-secret-token"
+# Start/stop/restart
+sudo systemctl start athena-tts
+sudo systemctl stop athena-tts
+sudo systemctl restart athena-tts
+
+# View logs
+sudo journalctl -u athena-tts -f
+
+# Check status
+sudo systemctl status athena-tts
 ```
 
-**Response (pending/processing):**
-```json
-{"job_id": "550e8400-e29b-41d4-a716-446655440000", "status": "processing"}
-```
-
-**Response (completed):**
-```json
-{
-  "job_id": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "completed",
-  "audio": "BASE64_ENCODED_WAV_DATA..."
-}
-```
-
-**Response (failed):**
-```json
-{
-  "job_id": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "failed",
-  "error": "TTS synthesis failed: ..."
-}
-```
-
-**Error responses:**
-- `401`: Unauthorized
-- `404`: Job not found
-- `429`: Rate limit exceeded
-
-### GET /api/speakers
-
-List available speaker voices.
-
-**Headers:**
-- `Authorization: Bearer <AUTH_TOKEN>` (required)
+### Environment File (`/etc/athena/tts.env`)
 
 ```bash
-curl http://localhost:5002/api/speakers \
-  -H "Authorization: Bearer your-secret-token"
+ATHENA_SERVER_URL=https://your-athena-server.com
+AGENT_KEY=your-shared-agent-key
+POLL_INTERVAL=1.0
 ```
 
-**Response:**
-```json
-{"speakers": ["jane", "john", "narrator"]}
-```
+## Makefile Commands
 
-### GET /health
-
-Health check endpoint (no authentication required).
-
-```bash
-curl http://localhost:5002/health
-```
-
-## Kubernetes Deployment
-
-### Prerequisites
-
-- Kubernetes cluster with GPU nodes
-- Helm 3.x
-- NVIDIA device plugin installed
-
-### Install
-
-```bash
-helm install athena-tts ./helm/athena-tts \
-  --set auth.token=your-secret-token
-```
-
-### Configuration
-
-Key values in `values.yaml`:
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `image.repository` | Container image | `ebennerv/athena-tts` |
-| `image.tag` | Image tag | `latest` |
-| `auth.token` | Bearer token for API auth | `""` |
-| `service.type` | Kubernetes service type | `ClusterIP` |
-| `service.port` | Service port | `5002` |
-| `security.rateLimitRequests` | Max requests per window | `300` |
-| `security.rateLimitWindowSeconds` | Rate limit window | `60` |
-| `security.authFailBanThreshold` | Auth failures before IP ban | `3` |
-| `security.authFailBanDurationSeconds` | Ban duration | `604800` |
-| `persistence.workspace.enabled` | Enable speaker file persistence | `true` |
-| `persistence.workspace.size` | PVC size for speaker files | `10Gi` |
-| `persistence.modelCache.enabled` | Enable model cache persistence | `true` |
-| `persistence.modelCache.size` | PVC size for model cache | `20Gi` |
-| `resources.limits.nvidia.com/gpu` | GPU allocation | `1` |
-
-**Important notes:**
-- Only `replicaCount: 1` is supported with `ReadWriteOnce` PVCs
-- For production, use external secrets management instead of `--set auth.token`
-- The `auth.token` value must be non-empty for the API to accept requests
-
-### Upgrade
-
-```bash
-helm upgrade athena-tts ./helm/athena-tts \
-  --set auth.token=your-secret-token
-```
-
-### Uninstall
-
-```bash
-helm uninstall athena-tts
-```
-
-## Persistent Volumes
-
-Two PVCs are created:
-- **workspace**: Speaker WAV files (`/workspace`)
-- **model-cache**: XTTS model files (`/root/.local/share/tts`)
-
-The model cache PVC speeds up startup on subsequent deploys by persisting the downloaded model.
+| Command | Description |
+|---------|-------------|
+| `make build` | Build Docker image |
+| `make push` | Build and push to registry |
+| `make run` | Run container with GPU |
+| `make stop` | Stop container |
+| `make logs` | View container logs |
+| `make health` | Check health endpoint |
+| `make lint` | Check code formatting |
+| `make fmt` | Format code with black |
 
 ## Speaker Files
 
@@ -290,6 +138,65 @@ Speaker WAV files are stored in `/workspace`. Requirements:
 - Format: WAV
 - Sample rate: 22050 Hz recommended
 - Duration: 6-30 seconds of clean speech
+
+The agent automatically discovers speakers from this directory and announces them to athena-server during registration and heartbeats.
+
+## Persistent Volumes
+
+Two volumes are needed:
+- **workspace** (`/workspace`): Speaker WAV files
+- **model-cache** (`/root/.local/share/tts`): XTTS model files
+
+The model cache speeds up startup by persisting the downloaded model (~2GB).
+
+## Kubernetes Deployment
+
+For Kubernetes deployment, use the Helm chart:
+
+```bash
+helm install athena-tts ./helm/athena-tts \
+  --set agent.serverUrl=http://athena-server:5003 \
+  --set agent.key=your-agent-key
+```
+
+### Helm Values
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `image.repository` | Container image | `ebennerv/athena-tts` |
+| `image.tag` | Image tag | `latest` |
+| `agent.serverUrl` | athena-server URL | (required) |
+| `agent.key` | Agent authentication key | (required) |
+| `agent.pollInterval` | Seconds between polls | `1.0` |
+| `persistence.workspace.size` | Speaker storage size | `10Gi` |
+| `persistence.modelCache.size` | Model cache size | `20Gi` |
+| `resources.limits.nvidia.com/gpu` | GPU allocation | `1` |
+
+## Monitoring
+
+The agent reports its status to athena-server:
+
+```bash
+# Check if agent is registered (via athena-server)
+curl https://your-athena-server.com/api/agents \
+  -H "Authorization: Bearer your-token"
+```
+
+Response shows agent status, last seen time, and available speakers:
+
+```json
+{
+  "agents": [
+    {
+      "agent_id": "tts-abc123",
+      "service_type": "tts",
+      "status": "active",
+      "last_seen": 1234567890.0,
+      "speakers": ["voice1", "voice2"]
+    }
+  ]
+}
+```
 
 ## Ethical Use & Disclaimer
 

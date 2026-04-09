@@ -31,7 +31,9 @@ AGENT_SERVICE_TYPE = "tts"
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0").strip())
 HEARTBEAT_INTERVAL = 60.0
 
-logger.info(f"Config: ATHENA_SERVER_URL={ATHENA_SERVER_URL[:30] + '...' if ATHENA_SERVER_URL else 'NOT SET'}")
+logger.info(
+    f"Config: ATHENA_SERVER_URL={ATHENA_SERVER_URL[:30] + '...' if ATHENA_SERVER_URL else 'NOT SET'}"
+)
 logger.info(f"Config: AGENT_KEY={'SET' if AGENT_KEY else 'NOT SET'}")
 
 http_client: Optional[httpx.AsyncClient] = None
@@ -136,7 +138,9 @@ async def agent_poll():
         return None
 
 
-async def agent_complete(job_id: str, status: str, result: Optional[dict], error: Optional[str]):
+async def agent_complete(
+    job_id: str, status: str, result: Optional[dict], error: Optional[str]
+):
     """Report job completion to athena-server."""
     try:
         payload = {
@@ -146,20 +150,24 @@ async def agent_complete(job_id: str, status: str, result: Optional[dict], error
             "error": error,
         }
         payload_size = len(str(payload))
-        logger.info(f"Completing job {job_id} with status={status}, payload_size={payload_size}")
-        
+        logger.info(
+            f"Completing job {job_id} with status={status}, payload_size={payload_size}"
+        )
+
         response = await http_client.post(
             f"{ATHENA_SERVER_URL}/api/agents/jobs/{job_id}/complete",
             headers={"X-Agent-Key": AGENT_KEY},
             json=payload,
             timeout=60.0,
         )
-        
+
         if response.status_code == 200:
             logger.info(f"Job {job_id} completed successfully")
             return True
         else:
-            logger.error(f"Job {job_id} complete failed: {response.status_code} {response.text}")
+            logger.error(
+                f"Job {job_id} complete failed: {response.status_code} {response.text}"
+            )
             return False
     except Exception as e:
         logger.error(f"Complete error for job {job_id}: {e}")
@@ -174,7 +182,9 @@ async def process_agent_job(job: dict):
     speaker = payload.get("speaker", "")
 
     if len(text) > MAX_TEXT_LENGTH:
-        await agent_complete(job_id, "failed", None, f"Text exceeds max length of {MAX_TEXT_LENGTH}")
+        await agent_complete(
+            job_id, "failed", None, f"Text exceeds max length of {MAX_TEXT_LENGTH}"
+        )
         return
 
     try:
@@ -182,7 +192,9 @@ async def process_agent_job(job: dict):
         speaker_path = os.path.join(WORKSPACE_DIR, f"{speaker_name}.wav")
 
         if not os.path.isfile(speaker_path):
-            await agent_complete(job_id, "failed", None, f"Speaker '{speaker_name}' not found")
+            await agent_complete(
+                job_id, "failed", None, f"Speaker '{speaker_name}' not found"
+            )
             return
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_out:
