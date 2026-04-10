@@ -10,6 +10,7 @@ import re
 import asyncio
 import uuid
 import base64
+import hashlib
 import logging
 from typing import Optional
 
@@ -75,22 +76,45 @@ def get_available_speakers() -> list[str]:
     return sorted(speakers)
 
 
+def get_local_voice_checksum(name: str) -> Optional[str]:
+    """Calculate MD5 checksum of a local voice file."""
+    filepath = os.path.join(WORKSPACE_DIR, f"{name}.wav")
+    if not os.path.isfile(filepath):
+        return None
+    hasher = hashlib.md5()
+    try:
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except OSError:
+        return None
+
+
+def get_local_voices_with_checksums() -> dict[str, str]:
+    """Get dict of local voice names to their checksums."""
+    voices = {}
+    for name in get_available_speakers():
+        checksum = get_local_voice_checksum(name)
+        if checksum:
+            voices[name] = checksum
+    return voices
+
+
 async def agent_register():
     """Register with athena-server as an agent."""
     try:
-        speakers = get_available_speakers()
         response = await http_client.post(
             f"{ATHENA_SERVER_URL}/api/agents/register",
             headers={"X-Agent-Key": AGENT_KEY},
             json={
                 "agent_id": AGENT_ID,
                 "service_type": AGENT_SERVICE_TYPE,
-                "speakers": speakers,
             },
             timeout=10.0,
         )
         if response.status_code == 200:
-            logger.info(f"Registered as agent {AGENT_ID} with {len(speakers)} speakers")
+            logger.info(f"Registered as agent {AGENT_ID}")
             return True
         else:
             logger.error(f"Failed to register: {response.status_code} {response.text}")
@@ -101,16 +125,14 @@ async def agent_register():
 
 
 async def agent_heartbeat():
-    """Send heartbeat to athena-server with current speaker list."""
+    """Send heartbeat to athena-server."""
     try:
-        speakers = get_available_speakers()
         response = await http_client.post(
             f"{ATHENA_SERVER_URL}/api/agents/heartbeat",
             headers={"X-Agent-Key": AGENT_KEY},
             json={
                 "agent_id": AGENT_ID,
                 "service_type": AGENT_SERVICE_TYPE,
-                "speakers": speakers,
             },
             timeout=10.0,
         )
@@ -118,6 +140,72 @@ async def agent_heartbeat():
     except Exception as e:
         logger.error(f"Heartbeat error: {e}")
         return False
+
+
+async def fetch_server_voices() -> list[dict]:
+    """Fetch voice list from server with checksums."""
+    try:
+        response = await http_client.get(
+            f"{ATHENA_SERVER_URL}/api/voices/list",
+            headers={"X-Agent-Key": AGENT_KEY},
+            timeout=30.0,
+        )
+        if response.status_code == 200:
+            return response.json().get("voices", [])
+        else:
+            logger.error(f"Failed to fetch voice list: {response.status_code}")
+            return []
+    except Exception as e:
+        logger.error(f"Error fetching voice list: {e}")
+        return []
+
+
+async def download_voice(name: str) -> bool:
+    """Download a voice file from server."""
+    try:
+        response = await http_client.get(
+            f"{ATHENA_SERVER_URL}/api/voices/{name}/download",
+            headers={"X-Agent-Key": AGENT_KEY},
+            timeout=120.0,
+        )
+        if response.status_code == 200:
+            filepath = os.path.join(WORKSPACE_DIR, f"{name}.wav")
+            with open(filepath, "wb") as f:
+                f.write(response.content)
+            logger.info(f"Downloaded voice: {name}")
+            return True
+        else:
+            logger.error(f"Failed to download voice {name}: {response.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"Error downloading voice {name}: {e}")
+        return False
+
+
+async def sync_voices():
+    """Sync voices from server - download missing or changed voices."""
+    server_voices = await fetch_server_voices()
+    if not server_voices:
+        logger.info("No voices from server or fetch failed, skipping sync")
+        return
+    
+    local_voices = get_local_voices_with_checksums()
+    
+    for voice in server_voices:
+        name = voice.get("name")
+        server_checksum = voice.get("checksum")
+        
+        if not name or not server_checksum:
+            continue
+        
+        local_checksum = local_voices.get(name)
+        
+        if local_checksum != server_checksum:
+            if local_checksum:
+                logger.info(f"Voice {name} changed, re-downloading...")
+            else:
+                logger.info(f"Voice {name} missing, downloading...")
+            await download_voice(name)
 
 
 async def agent_poll():
@@ -248,12 +336,17 @@ async def agent_worker():
 
 
 async def heartbeat_worker():
-    """Background task to send heartbeats every minute."""
+    """Background task to send heartbeats and sync voices."""
     logger.info("Heartbeat worker starting...")
     try:
+        logger.info("Initial voice sync starting...")
+        await sync_voices()
+        logger.info("Initial voice sync complete")
+        
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
             await agent_heartbeat()
+            await sync_voices()
     except asyncio.CancelledError:
         logger.info("Heartbeat worker shutting down gracefully")
         raise

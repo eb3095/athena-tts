@@ -12,7 +12,7 @@ A text-to-speech agent using the XTTS v2 model from Coqui TTS. Operates as a dis
 - Agent-based architecture (registers with athena-server)
 - Heartbeat monitoring (reports liveness every minute)
 - Speaker voice cloning from WAV files
-- Automatic speaker list announcement to server
+- **Automatic voice sync from athena-server** - Downloads and caches voices
 - Persistent speaker and model storage
 - Single-worker model with job polling
 - GPU acceleration support
@@ -22,26 +22,27 @@ A text-to-speech agent using the XTTS v2 model from Coqui TTS. Operates as a dis
 ```
 ┌─────────────────┐     ┌─────────────────┐
 │  athena-server  │◀────│   athena-tts    │
-│    (central)    │     │    (agent)      │
+│    (central)    │────▶│    (agent)      │
 └────────┬────────┘     └─────────────────┘
-         │
-         │  1. Register
-         │  2. Heartbeat (every 60s, with speaker list)
-         │  3. Poll for jobs
-         │  4. Complete jobs
-         │
-┌────────▼────────┐
-│      Redis      │
-│   (job queue)   │
-└─────────────────┘
+         │                      │
+         │  1. Register         │  voices sync
+         │  2. Heartbeat        │  (download on
+         │  3. Poll for jobs    │   heartbeat)
+         │  4. Complete jobs    │
+         │                      │
+┌────────▼────────┐     ┌───────▼─────────┐
+│      Redis      │     │   /workspace    │
+│   (job queue)   │     │  (voice cache)  │
+└─────────────────┘     └─────────────────┘
 ```
 
 The agent:
 1. Registers with athena-server on startup
-2. Sends heartbeats every 60 seconds (includes available speakers)
-3. Polls for TTS jobs from the server
-4. Processes jobs using XTTS v2 model
-5. Reports job completion with base64-encoded audio
+2. Syncs voices from server (downloads missing/changed voices)
+3. Sends heartbeats every 60 seconds with voice sync
+4. Polls for TTS jobs from the server
+5. Processes jobs using XTTS v2 model
+6. Reports job completion with base64-encoded audio
 
 ## Configuration
 
@@ -138,12 +139,23 @@ POLL_INTERVAL=1.0
 
 ## Speaker Files
 
-Speaker WAV files are stored in `/workspace`. Requirements:
+Speaker WAV files are stored in `/workspace` and are automatically synced from athena-server.
+
+### Voice Sync
+On startup and every heartbeat (60 seconds), the agent:
+1. Fetches the voice list from athena-server (with checksums)
+2. Compares with local voice files
+3. Downloads any missing or changed voices
+
+This means voice management is centralized on athena-server - just upload voices there and all TTS agents will automatically sync them.
+
+### Voice Requirements
 - Format: WAV
-- Sample rate: 22050 Hz recommended
+- Sample rate: 22050 Hz
+- Channels: Mono
 - Duration: 6-30 seconds of clean speech
 
-The agent automatically discovers speakers from this directory and announces them to athena-server during registration and heartbeats.
+Use the [athena-voice-print](https://github.com/eb3095/athena-voice-print) tool to convert voice clips to the correct format.
 
 ## Persistent Volumes
 
@@ -186,7 +198,7 @@ curl https://your-athena-server.com/api/agents \
   -H "Authorization: Bearer your-token"
 ```
 
-Response shows agent status, last seen time, and available speakers:
+Response shows agent status and last seen time:
 
 ```json
 {
@@ -195,11 +207,17 @@ Response shows agent status, last seen time, and available speakers:
       "agent_id": "tts-abc123",
       "service_type": "tts",
       "status": "active",
-      "last_seen": 1234567890.0,
-      "speakers": ["voice1", "voice2"]
+      "last_seen": 1234567890.0
     }
   ]
 }
+```
+
+To see available voices, query the server directly:
+
+```bash
+curl https://your-athena-server.com/api/voices \
+  -H "Authorization: Bearer your-token"
 ```
 
 ## Ethical Use & Disclaimer
